@@ -11,6 +11,7 @@
 #include <reshade.hpp>
 #include <d3d11.h>
 #include <d3d11shader.h>
+#include "ffx_antilag2_dx11.h"  // AMD Anti-Lag 2 SDK (MIT), header-only
 #include <cstddef>
 #include <algorithm>
 #include <cmath>
@@ -376,9 +377,11 @@ static void DestroyMotionPass(device* dev);
 static void DestroySkinVelocity(device* dev);
 static void ShutdownUpscaler(device* dev);
 static void ReleaseInputLayoutCache();
+static void ShutdownLatency(device* dev);
 
 static void OnDestroyDevice(device* dev)
 {
+    ShutdownLatency(dev);
     ReleaseInputLayoutCache();
     DestroySubstitutes(dev);
     DestroyMotionPass(dev);
@@ -762,9 +765,77 @@ static void ReleaseInputLayoutCache()
     g_layoutCache.clear();
 }
 
-// [Latency] MaxFrameLatency: how many frames the CPU may queue ahead of the GPU (DXGI default 3). 1 keeps
-// input-to-display latency low, like the drivers' low-latency modes; 0 leaves the game's setting alone.
+// ---------------------------------------------------------------- latency
+// [Latency] AntiLag2: AMD Anti-Lag 2 (Radeon driver, DX11 via amdxx64.dll). Its Update() call belongs right
+// before the game polls input; the closest point an injected mod has is the present of the previous frame.
+// [Latency] MaxFrameLatency: fallback when Anti-Lag 2 is unavailable (NVIDIA, Intel, old drivers): how many
+// frames the CPU may queue ahead of the GPU (DXGI default 3); 0 leaves the game's setting alone.
+
+static bool g_antiLag2Wanted = true;
 static int g_maxFrameLatency = 1;
+static AMD::AntiLag2DX11::Context g_antiLag2 = {};
+static enum { kLatencyPending, kLatencyAntiLag2, kLatencyFallback } g_latencyMode = kLatencyPending;
+static ID3D11Device* g_latencyDevice = nullptr;  // not owned; valid between init_device and destroy_device
+
+static void ApplyMaxFrameLatency(ID3D11Device* d3d)
+{
+    IDXGIDevice1* dxgi = nullptr;
+    if (g_maxFrameLatency > 0 && SUCCEEDED(d3d->QueryInterface(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&dxgi)))) {
+        dxgi->SetMaximumFrameLatency(static_cast<UINT>(g_maxFrameLatency));
+        dxgi->Release();
+        LOGI("latency: maximum frame latency set to %d", g_maxFrameLatency);
+    }
+}
+
+// Once per frame, at present. The driver module is only loaded once the device renders, so Anti-Lag 2 is
+// initialised on the first frame rather than at device creation.
+static void LatencyFrameEnd()
+{
+    if (!g_latencyDevice)
+        return;
+    if (g_latencyMode == kLatencyPending) {
+        HRESULT hr = g_antiLag2Wanted ? AMD::AntiLag2DX11::Initialize(&g_antiLag2) : E_ABORT;
+        if (hr == S_OK) {
+            g_latencyMode = kLatencyAntiLag2;
+            LOGI("latency: AMD Anti-Lag 2 active");
+        } else {
+            g_latencyMode = kLatencyFallback;
+            if (g_antiLag2Wanted)
+                LOGI("latency: AMD Anti-Lag 2 not available (0x%08x), using the frame queue limit", static_cast<unsigned>(hr));
+            ApplyMaxFrameLatency(g_latencyDevice);
+        }
+    }
+    if (g_latencyMode != kLatencyAntiLag2)
+        return;
+    // The driver inserts its latency-reducing wait inside this call: time it to show Anti-Lag 2 is working.
+    static int64_t waitSum = 0, waitMax = 0;
+    static unsigned calls = 0, okCount = 0;
+    static ULONGLONG lastLog = GetTickCount64();
+    const int64_t t0 = Now();
+    const HRESULT hr = AMD::AntiLag2DX11::Update(&g_antiLag2, true, 0);
+    const int64_t waited = Now() - t0;
+    waitSum += waited;
+    waitMax = std::max(waitMax, waited);
+    ++calls;
+    okCount += hr == S_OK;
+    if (g_debugKeys && GetTickCount64() - lastLog >= 5000) {
+        lastLog = GetTickCount64();
+        LOGI("latency: Anti-Lag 2 %u updates (%u S_OK), driver wait avg %.3f ms max %.3f ms", calls, okCount,
+             TicksToMs(waitSum) / calls, TicksToMs(waitMax));
+        waitSum = waitMax = 0;
+        calls = okCount = 0;
+    }
+}
+
+static void ShutdownLatency(device* dev)
+{
+    if (!g_latencyDevice || reinterpret_cast<ID3D11Device*>(dev->get_native()) != g_latencyDevice)
+        return;
+    if (g_latencyMode == kLatencyAntiLag2)
+        AMD::AntiLag2DX11::DeInitialize(&g_antiLag2);
+    g_latencyDevice = nullptr;
+    g_latencyMode = kLatencyPending;
+}
 
 static void OnInitDevice(device* dev)
 {
@@ -772,12 +843,6 @@ static void OnInitDevice(device* dev)
         return;
     auto* d3d = reinterpret_cast<ID3D11Device*>(dev->get_native());
     InstallInputLayoutCache(d3d);
-    IDXGIDevice1* dxgi = nullptr;
-    if (g_maxFrameLatency > 0 && SUCCEEDED(d3d->QueryInterface(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&dxgi)))) {
-        dxgi->SetMaximumFrameLatency(static_cast<UINT>(g_maxFrameLatency));
-        dxgi->Release();
-        LOGI("maximum frame latency set to %d", g_maxFrameLatency);
-    }
 }
 static ShaderAnalysis AnalysePixelShader(const shader_desc* desc);
 static ShaderAnalysis AnalyseVertexShader(const shader_desc* desc);
@@ -2075,6 +2140,7 @@ static void LoadConfig()
     g_upscalerEnabled = GetPrivateProfileIntA("Upscaler", "Enabled", 1, ini.c_str()) != 0;
     GetPrivateProfileStringA("Upscaler", "ToggleKey", "Home", key, sizeof(key), ini.c_str());
     g_toggleKey = ParseKey(key, VK_HOME);
+    g_antiLag2Wanted = GetPrivateProfileIntA("Latency", "AntiLag2", 1, ini.c_str()) != 0;
     g_maxFrameLatency = GetPrivateProfileIntA("Latency", "MaxFrameLatency", 1, ini.c_str());
     g_debugKeys = GetPrivateProfileIntA("Debug", "DeveloperMode", 0, ini.c_str()) != 0;
     LOGI("config: upscaler %s, toggle Ctrl+Shift+%s, developer mode %s", g_upscalerEnabled ? "on" : "off", key,
@@ -2234,12 +2300,17 @@ static void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint
     CameraFrameEnd();
     TraceFrameEnd();
     BenchFrameEnd();
+    LatencyFrameEnd();
 }
 
 static void OnInitSwapchain(swapchain* sc, bool resize)
 {
     resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
     LOGI("swapchain %s: back buffer %ux%u", resize ? "resized" : "created", d.texture.width, d.texture.height);
+    // Anti-Lag 2 / frame latency follow the device that presents (the game and OptiScaler also create
+    // short-lived helper devices).
+    if (sc->get_device()->get_api() == device_api::d3d11)
+        g_latencyDevice = reinterpret_cast<ID3D11Device*>(sc->get_device()->get_native());
 }
 
 // ---------------------------------------------------------------- entry
