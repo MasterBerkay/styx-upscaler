@@ -13,6 +13,8 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 - Fix for the invisible menus of the DX11 mode (Scaleform binds RTV/DSV pairs of different size)
 - Input-layout cache against camera-turn stutter
 - AMD Anti-Lag 2 (DX11 SDK) with a `SetMaximumFrameLatency` fallback on other GPUs
+- Live quality presets (writes the engine's `GSystemSettings.ScreenPercentage`) and a settings menu in the
+  ReShade overlay (Dear ImGui)
 
 Player downloads (bundled with ReShade and OptiScaler) are on Nexus Mods. Companion mod:
 [styx-engine-fix](https://github.com/MasterBerkay/styx-engine-fix) – high FPS without flying ragdolls.
@@ -38,7 +40,9 @@ The add-on uses ReShade 6.x API events on the immediate context:
    (near plane 10, infinite far) and takes the object velocity where its depth matches the scene.
 6. **Latency** – AMD Anti-Lag 2 `Update()` at every present of the swapchain device (helper devices
    created by the game / OptiScaler are ignored); without it, `IDXGIDevice1::SetMaximumFrameLatency`.
-7. **Upscale** – right before the final `SceneColorTexture` → back buffer pass: NGX evaluate (OptiScaler),
+7. **Quality presets** – `ScreenPercentage` sits at a fixed `.data` address of the Steam build (sanity-checked);
+   the engine reads it every frame, so writing it changes the render resolution live.
+8. **Upscale** – right before the final `SceneColorTexture` → back buffer pass: NGX evaluate (OptiScaler),
    then a replacement pass `pow(saturate(lerp(scene * ColorScale, Overlay.rgb, Overlay.a)), InverseGamma)`.
 
 ## Building
@@ -62,12 +66,13 @@ Next to `Binaries\Win64\StyxGame.exe`: ReShade 6.x **with add-on support** as `d
 DLLs from the OptiScaler release, `StyxUpscaler.addon64` and `dist\StyxUpscaler.ini`.
 Launch the game with `-dx11` and set `MaxMultiSamples=1` in `StyxSystemSettings.ini`.
 
-Settings (`StyxUpscaler.ini`): `[Upscaler] Enabled`, `ToggleKey` (with Ctrl+Shift, default Home),
+Settings (`StyxUpscaler.ini`): `[Upscaler] Enabled`, `ToggleKey` (with Ctrl+Shift, default Home), `QualityKey` (default PageUp),
 `[Latency] AntiLag2`, `MaxFrameLatency`, `[Debug] DeveloperMode` (debug views, bypass, benchmark, statistics).
 
 ## License
 
 MIT (see `LICENSE`) for the code in this repository. `src/ffx_antilag2_dx11.h` is the AMD Anti-Lag 2 SDK
-(MIT, © Advanced Micro Devices, see `src/ffx_antilag2_LICENSE.txt`). Builds contain object code of the NVIDIA NGX SDK,
+(MIT, © Advanced Micro Devices, see `src/ffx_antilag2_LICENSE.txt`); `src/imgui/` holds the Dear ImGui 1.92.5
+(docking) headers (MIT, © Omar Cornut, see `src/imgui/LICENSE.txt`). Builds contain object code of the NVIDIA NGX SDK,
 which stays under NVIDIA's license. Styx: Master of Shadows is © Cyanide / Focus Entertainment; no game
 files are included. Not affiliated with Cyanide, Focus Entertainment, AMD, NVIDIA or Intel.

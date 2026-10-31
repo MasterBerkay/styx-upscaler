@@ -8,6 +8,9 @@
 // UI lands in an offscreen texture. We substitute a depth-stencil of matching size whenever the
 // game binds such a mismatched pair, and mirror the game's clears onto it.
 
+#define IMGUI_DISABLE_INCLUDE_IMCONFIG_H
+#define ImTextureID ImU64
+#include <imgui.h>  // Dear ImGui 1.92.5 headers (MIT): ReShade provides the implementation for overlays
 #include <reshade.hpp>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -26,8 +29,9 @@
 
 using namespace reshade::api;
 
-extern "C" __declspec(dllexport) const char* NAME = "StyxUpscaler";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Styx: Master of Shadows DX11 fixes and upscaler integration.";
+extern "C" __declspec(dllexport) const char* NAME = "Styx Upscaler";
+extern "C" __declspec(dllexport) const char* DESCRIPTION =
+    "FSR 4 / DLSS / XeSS for Styx: Master of Shadows (DX11) through OptiScaler, plus DX11 menu fix and AMD Anti-Lag 2.";
 
 static void Log(reshade::log::level level, const char* fmt, ...)
 {
@@ -812,7 +816,7 @@ static void LatencyFrameEnd()
     static unsigned calls = 0, okCount = 0;
     static ULONGLONG lastLog = GetTickCount64();
     const int64_t t0 = Now();
-    const HRESULT hr = AMD::AntiLag2DX11::Update(&g_antiLag2, true, 0);
+    const HRESULT hr = AMD::AntiLag2DX11::Update(&g_antiLag2, g_antiLag2Wanted, 0);  // switchable in the overlay
     const int64_t waited = Now() - t0;
     waitSum += waited;
     waitMax = std::max(waitMax, waited);
@@ -2112,7 +2116,8 @@ static bool MaybeRunMotionPass(command_list* cmd)
 
 // ---------------------------------------------------------------- config (StyxUpscaler.ini next to the exe)
 
-static int g_toggleKey = VK_HOME;  // Ctrl+Shift+<key> toggles the upscaler
+static int g_toggleKey = VK_HOME;    // Ctrl+Shift+<key> toggles the upscaler
+static int g_qualityKey = VK_PRIOR;  // Ctrl+Shift+<key> cycles the quality presets
 
 // Key names accepted in the ini: Home, End, Insert, Delete, PageUp, PageDown, F1..F12, A..Z, 0..9.
 static int ParseKey(const char* name, int fallback)
@@ -2140,6 +2145,8 @@ static void LoadConfig()
     g_upscalerEnabled = GetPrivateProfileIntA("Upscaler", "Enabled", 1, ini.c_str()) != 0;
     GetPrivateProfileStringA("Upscaler", "ToggleKey", "Home", key, sizeof(key), ini.c_str());
     g_toggleKey = ParseKey(key, VK_HOME);
+    GetPrivateProfileStringA("Upscaler", "QualityKey", "PageUp", key, sizeof(key), ini.c_str());
+    g_qualityKey = ParseKey(key, VK_PRIOR);
     g_antiLag2Wanted = GetPrivateProfileIntA("Latency", "AntiLag2", 1, ini.c_str()) != 0;
     g_maxFrameLatency = GetPrivateProfileIntA("Latency", "MaxFrameLatency", 1, ini.c_str());
     g_debugKeys = GetPrivateProfileIntA("Debug", "DeveloperMode", 0, ini.c_str()) != 0;
@@ -2163,6 +2170,73 @@ static bool HotkeyPressed(int vk, bool& wasDown)
     return pressed;
 }
 
+// ---------------------------------------------------------------- quality presets
+// The render resolution is the engine's GSystemSettings.ScreenPercentage, read every frame. It lives at a
+// fixed place in StyxGame.exe's .data section (Steam build 1.0.10499); writing it switches the resolution
+// live, and the upscaler feature follows. The choice is also saved to StyxSystemSettings.ini.
+
+struct QualityPreset {
+    const char* name;
+    float percent;
+};
+static const QualityPreset kPresets[] = {
+    {"Native AA", 100.0f}, {"Quality", 67.0f}, {"Balanced", 59.0f}, {"Performance", 50.0f}};
+static float* g_screenPercentage = nullptr;
+
+static float* FindScreenPercentage()
+{
+    static bool searched = false;
+    if (searched)
+        return g_screenPercentage;
+    searched = true;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    auto* p = reinterpret_cast<float*>(base + 0x3553390);
+    // Sanity check against an unknown game build: a plausible percentage followed by bUpscaleScreenPercentage.
+    const uint32_t next = *reinterpret_cast<const uint32_t*>(p + 1);
+    if (*p >= 10.0f && *p <= 200.0f && next <= 1) {
+        LOGI("quality: ScreenPercentage found (%.0f%%)", *p);
+        return p;
+    }
+    LOGW("quality: ScreenPercentage not found (unknown game build), presets disabled");
+    return nullptr;
+}
+
+// %USERPROFILE%\Documents (or its redirected location) via the registry.
+static std::string GameConfigFile(const char* name)
+{
+    char raw[MAX_PATH] = {}, expanded[MAX_PATH] = {};
+    DWORD size = sizeof(raw);
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+                     "Personal", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, nullptr, raw, &size) != ERROR_SUCCESS)
+        return "";
+    ExpandEnvironmentStringsA(raw, expanded, MAX_PATH);
+    return std::string(expanded) + "\\My Games\\Styx\\StyxGame\\Config\\" + name;
+}
+
+static void SetQualityPreset(int index)
+{
+    if (!g_screenPercentage)
+        return;
+    const QualityPreset& q = kPresets[index];
+    *g_screenPercentage = q.percent;
+    const std::string ini = GameConfigFile("StyxSystemSettings.ini");
+    char value[32];
+    snprintf(value, sizeof(value), "%f", q.percent);
+    if (!ini.empty())
+        WritePrivateProfileStringA("SystemSettings", "ScreenPercentage", value, ini.c_str());
+    LOGI("quality: %s (%.0f%% render resolution)", q.name, q.percent);
+}
+
+static int CurrentQualityPreset()
+{
+    if (!g_screenPercentage)
+        return -1;
+    for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
+        if (fabsf(*g_screenPercentage - kPresets[i].percent) < 0.5f)
+            return i;
+    return -1;  // custom value from the ini
+}
+
 static void MotionFrameEnd()
 {
     static bool upWasDown = false;
@@ -2170,6 +2244,11 @@ static void MotionFrameEnd()
         g_upscalerEnabled = !g_upscalerEnabled;
         g_up.resetNext = true;
         LOGI("upscaler %s", g_upscalerEnabled ? "ON" : "OFF");
+    }
+    static bool qualityWasDown = false;
+    if (HotkeyPressed(g_qualityKey, qualityWasDown)) {
+        g_screenPercentage = FindScreenPercentage();
+        SetQualityPreset((CurrentQualityPreset() + 1) % static_cast<int>(std::size(kPresets)));
     }
     if (g_debugKeys) {  // developer mode only: Ctrl+Shift+M/J/O/P/B
         static bool debugWasDown = false, jitterWasDown = false, objectWasDown = false, probeWasDown = false,
@@ -2313,6 +2392,81 @@ static void OnInitSwapchain(swapchain* sc, bool resize)
         g_latencyDevice = reinterpret_cast<ID3D11Device*>(sc->get_device()->get_native());
 }
 
+// ---------------------------------------------------------------- settings overlay
+// Shown in the ReShade overlay (Home) under Add-ons > Styx Upscaler. Changes apply live and are saved.
+
+static void SaveSetting(const char* section, const char* key, int value)
+{
+    char text[16];
+    snprintf(text, sizeof(text), "%d", value);
+    WritePrivateProfileStringA(section, key, text, GameDirFile("StyxUpscaler.ini").c_str());
+}
+
+static const char* KeyName(int vk)
+{
+    static char buf[8];
+    switch (vk) {
+    case VK_HOME: return "Home";
+    case VK_END: return "End";
+    case VK_INSERT: return "Insert";
+    case VK_DELETE: return "Delete";
+    case VK_PRIOR: return "PageUp";
+    case VK_NEXT: return "PageDown";
+    }
+    if (vk >= VK_F1 && vk <= VK_F12)
+        snprintf(buf, sizeof(buf), "F%d", vk - VK_F1 + 1);
+    else
+        snprintf(buf, sizeof(buf), "%c", vk);
+    return buf;
+}
+
+static void DrawSettings(effect_runtime*)
+{
+    if (ImGui::Checkbox("Upscaler (FSR / DLSS / XeSS via OptiScaler)", &g_upscalerEnabled)) {
+        g_up.resetNext = true;
+        SaveSetting("Upscaler", "Enabled", g_upscalerEnabled);
+    }
+    if (g_upscalerEnabled && g_up.renderWidth)
+        ImGui::TextDisabled("Rendering %ux%u, output %ux%u", g_up.renderWidth, g_up.renderHeight, g_up.outWidth,
+                            g_up.outHeight);
+    else if (g_upscalerEnabled)
+        ImGui::TextDisabled("Waiting for the first game frame...");
+
+    g_screenPercentage = FindScreenPercentage();
+    if (g_screenPercentage) {
+        const int current = CurrentQualityPreset();
+        char preview[48];
+        if (current >= 0)
+            snprintf(preview, sizeof(preview), "%s (%.0f%%)", kPresets[current].name, kPresets[current].percent);
+        else
+            snprintf(preview, sizeof(preview), "Custom (%.0f%%)", *g_screenPercentage);
+        if (ImGui::BeginCombo("Quality", preview)) {
+            for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i) {
+                char label[48];
+                snprintf(label, sizeof(label), "%s (%.0f%%)", kPresets[i].name, kPresets[i].percent);
+                if (ImGui::Selectable(label, i == current))
+                    SetQualityPreset(i);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled("Native AA = best image. Lower presets help when the GPU is the bottleneck.");
+    } else {
+        ImGui::TextDisabled("Quality presets unavailable (unknown game version).");
+    }
+
+    ImGui::Separator();
+    if (ImGui::Checkbox("AMD Anti-Lag 2", &g_antiLag2Wanted))
+        SaveSetting("Latency", "AntiLag2", g_antiLag2Wanted);
+    if (g_latencyMode == kLatencyAntiLag2)
+        ImGui::TextDisabled(g_antiLag2Wanted ? "Active (Radeon driver)" : "Off");
+    else if (g_latencyMode == kLatencyFallback)
+        ImGui::TextDisabled("Not available on this GPU/driver: frame queue limited to %d instead", g_maxFrameLatency);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Hotkeys: Ctrl+Shift+%s upscaler on/off", KeyName(g_toggleKey));
+    ImGui::TextDisabled("         Ctrl+Shift+%s next quality preset", KeyName(g_qualityKey));
+}
+
 // ---------------------------------------------------------------- entry
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
@@ -2323,6 +2477,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             return FALSE;
         g_traceEnabled = GetFileAttributesA(GameDirFile("StyxUpscaler_trace.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
         LoadConfig();
+        reshade::register_overlay(nullptr, &DrawSettings);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
         reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDsv);
         reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
