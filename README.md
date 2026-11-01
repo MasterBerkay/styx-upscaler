@@ -16,8 +16,9 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 - Live quality presets (writes the engine's `GSystemSettings.ScreenPercentage`) and a settings menu in the
   ReShade overlay (Dear ImGui)
 
-Player downloads (bundled with ReShade and OptiScaler) are on Nexus Mods. Companion mod:
-[styx-engine-fix](https://github.com/MasterBerkay/styx-engine-fix) – high FPS without flying ragdolls.
+Player downloads (bundled with ReShade and OptiScaler) are on
+[Nexus Mods](https://www.nexusmods.com/styxmasterofshadows/mods/9). Companion mod:
+[Styx Engine Fix](https://www.nexusmods.com/styxmasterofshadows/mods/10) ([source](https://github.com/MasterBerkay/styx-engine-fix)) – high FPS without flying ragdolls.
 
 ## How it works
 
