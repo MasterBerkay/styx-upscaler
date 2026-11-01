@@ -12,6 +12,7 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 - The upscaled image is fed through an equivalent of the game's gamma pass, HUD stays native
 - Fix for the invisible menus of the DX11 mode (Scaleform binds RTV/DSV pairs of different size)
 - Input-layout cache against camera-turn stutter
+- Low CPU overhead on the game's single rendering thread (no locks or lookups on ordinary draw calls)
 - AMD Anti-Lag 2 (DX11 SDK) with a `SetMaximumFrameLatency` fallback on other GPUs
 - Live quality presets (writes the engine's `GSystemSettings.ScreenPercentage`) and a settings menu in the
   ReShade overlay (Dear ImGui)

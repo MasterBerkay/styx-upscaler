@@ -17,6 +17,7 @@
 #include "ffx_antilag2_dx11.h"  // AMD Anti-Lag 2 SDK (MIT), header-only
 #include <cstddef>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -45,22 +46,44 @@ static void Log(reshade::log::level level, const char* fmt, ...)
 #define LOGI(...) Log(reshade::log::level::info, __VA_ARGS__)
 #define LOGW(...) Log(reshade::log::level::warning, __VA_ARGS__)
 
-// Currently bound state per command list (only what the add-on needs).
+// Where a vertex shader keeps the view transform (VSOffsetConstants), see ReflectVertexShader.
+struct VsCbInfo {
+    int slot = -1;
+    uint32_t vpOffset = 0, pvtOffset = 0;
+};
+
+// GPU-skinned vertex shaders (characters): where to find LocalToWorld / MeshOrigin / MeshExtension in $Globals (b0).
+struct SkinInfo {
+    uint32_t l2w = 0, origin = 0, extension = 0;
+};
+
+// Where the final pass (UE3 gamma pass: HDR scene color -> back buffer) keeps its constants (all in $Globals).
+struct FinalPsInfo {
+    uint32_t slot = 0, colorScale = 0, overlayColor = 0, inverseGamma = 0;
+};
+
+// What the draw callbacks need to know about a bound shader. Looked up once when the shader is bound,
+// so the ~3000 draws per frame need no lock or map lookup.
+struct PipeInfo {
+    VsCbInfo cb;
+    SkinInfo skin;
+    uint32_t rigidL2W = 0;
+    bool skinned = false, rigid = false, isFinal = false, haveFinalInfo = false;
+    FinalPsInfo fpi;
+};
+
+// Currently bound state per command list (only what the add-on needs). Index/vertex buffers, viewport and
+// output-merger states are read from the context on the few draws that need them instead of tracked.
 struct BindState {
     uint64_t vs = 0, ps = 0;
+    PipeInfo vsInfo, psInfo;
+    uint32_t vsGen = 0, psGen = 0;
     uint64_t vsCb[14] = {};
     resource_view psSrv0 = {0};
     resource_view rtv = {0};
     resource_view dsv = {0};
     resource_view rtvs[8] = {};
     uint32_t rtvCount = 0;
-    uint64_t depthStencilState = 0, blendState = 0;
-    uint32_t stencilRef = 0;
-    uint64_t indexBuffer = 0, vertexBuffer0 = 0;
-    uint64_t psCb[14] = {};
-    uint64_t inputLayout = 0;
-    uint32_t topology = 0;
-    viewport vp = {};
     uint64_t dsvRes = 0;     // resource behind dsv (resolved once per bind, not per draw)
     bool mainScene = false;  // HDR scene color + matching depth bound (base pass of the main view)
 };
@@ -274,7 +297,7 @@ static resource_view GetSubstitute(device* dev, resource_view gameDsv, uint32_t 
         sub = {};
     }
     format viewFormat = dev->get_resource_view_desc(gameDsv).format;
-    resource_desc desc(w, h, 1, 1, format_to_typeless(viewFormat), 1, memory_heap::gpu_only, resource_usage::depth_stencil);
+    resource_desc desc(w, h, 1, 1, format_to_typeless(viewFormat), 1, memory_heap::default_, resource_usage::depth_stencil);
     if (!dev->create_resource(desc, nullptr, resource_usage::depth_stencil_write, &sub.res)) {
         LOGW("failed to create substitute depth-stencil %ux%u", w, h);
         return {0};
@@ -399,11 +422,6 @@ static void OnDestroyDevice(device* dev)
 // We find its slot/offsets by reflecting vertex shaders, shadow constant buffer contents on
 // map/update, and snapshot the values bound while the base pass draws into the HDR scene color.
 
-struct VsCbInfo {
-    int slot = -1;
-    uint32_t vpOffset = 0, pvtOffset = 0;
-};
-
 struct Camera {
     float viewProj[16] = {};
     float preViewTranslation[4] = {};
@@ -439,10 +457,9 @@ static float Halton(uint32_t index, uint32_t base)
 }
 
 static std::mutex g_camMutex;
-static std::unordered_map<uint64_t, VsCbInfo> g_vsInfo;                 // vertex shader -> layout
-static std::unordered_map<uint64_t, std::vector<uint8_t>> g_cbShadow;   // constant buffer -> contents
+static std::unordered_map<uint64_t, PipeInfo> g_pipeInfo;  // shader -> info, only shaders the add-on cares about
+static std::atomic<uint32_t> g_pipeGen{1};                 // bumped on every change of g_pipeInfo
 static uint32_t g_cbReadEnd = 128;  // see OnUpdateBuffer: only this prefix of each buffer is shadowed
-static std::unordered_map<uint64_t, void*> g_cbMapped;                   // constant buffer -> mapped ptr
 static Camera g_camCur, g_camPrev, g_camPrev2;
 static unsigned g_camSnapshots = 0;
 static Camera g_camFirst;            // first main-pass camera of the frame
@@ -542,13 +559,6 @@ static VsCbInfo ReflectVertexShader(const void* code, size_t size)
     return info;
 }
 
-static std::unordered_map<uint64_t, bool> g_finalPassPs;  // UE3 gamma/final pass: HDR scene color -> back buffer
-
-// Where the final pass keeps its constants (all in $Globals).
-struct FinalPsInfo {
-    uint32_t slot = 0, colorScale = 0, overlayColor = 0, inverseGamma = 0;
-};
-static std::unordered_map<uint64_t, FinalPsInfo> g_finalPsInfo;
 
 static bool Contains(const void* data, size_t size, const char* needle)
 {
@@ -559,12 +569,6 @@ static bool Contains(const void* data, size_t size, const char* needle)
             return true;
     return false;
 }
-
-// GPU-skinned vertex shaders (characters): where to find LocalToWorld / MeshOrigin / MeshExtension in $Globals (b0).
-struct SkinInfo {
-    uint32_t l2w = 0, origin = 0, extension = 0;
-};
-static std::unordered_map<uint64_t, SkinInfo> g_skinVs;
 
 static bool ReflectSkin(const void* code, size_t size, SkinInfo* out)
 {
@@ -601,8 +605,6 @@ static bool ReflectSkin(const void* code, size_t size, SkinInfo* out)
 }
 
 // Non-skinned vertex shaders with a LocalToWorld in $Globals (b0) and POSITION in v0.
-static std::unordered_map<uint64_t, uint32_t> g_rigidVs;  // vertex shader -> LocalToWorld offset
-
 static bool ReflectRigid(const void* code, size_t size, uint32_t* l2wOffset)
 {
     PFN_D3DReflect reflect = LoadReflect();
@@ -853,11 +855,13 @@ static ShaderAnalysis AnalyseVertexShader(const shader_desc* desc);
 
 static void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline pipe)
 {
-    const int64_t t0 = Now();
+    const int64_t t0 = g_debugKeys ? Now() : 0;
     struct AddPipeTicks {
         int64_t t0;
         ~AddPipeTicks()
         {
+            if (!g_debugKeys)
+                return;
             int64_t t = Now() - t0;
             g_pipeTicks += t;
             g_pipeMaxTicks = std::max(g_pipeMaxTicks, t);
@@ -912,29 +916,24 @@ static void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipel
         }
         if (a.rigid)
             need(a.rigidL2W + 64);
+        // A new shader may reuse the address of a destroyed one: always replace or drop the old entry.
+        PipeInfo pi;
         if (isPs) {
-            if (a.haveFinalInfo)
-                g_finalPsInfo[pipe.handle] = a.fpi;
-            else
-                g_finalPsInfo.erase(pipe.handle);
-            if (a.isFinal)
-                g_finalPassPs[pipe.handle] = true;
-            else
-                g_finalPassPs.erase(pipe.handle);
-            continue;
+            pi.isFinal = a.isFinal;
+            pi.haveFinalInfo = a.haveFinalInfo;
+            pi.fpi = a.fpi;
+        } else {
+            pi.cb = a.vsInfo;
+            pi.skinned = a.skinned;
+            pi.skin = a.skin;
+            pi.rigid = a.rigid;
+            pi.rigidL2W = a.rigidL2W;
         }
-        if (a.skinned)
-            g_skinVs[pipe.handle] = a.skin;
-        else
-            g_skinVs.erase(pipe.handle);
-        if (a.rigid)
-            g_rigidVs[pipe.handle] = a.rigidL2W;
-        else
-            g_rigidVs.erase(pipe.handle);
-        if (a.vsInfo.slot >= 0)
-            g_vsInfo[pipe.handle] = a.vsInfo;
-        else
-            g_vsInfo.erase(pipe.handle);
+        if (pi.isFinal || pi.skinned || pi.rigid || pi.cb.slot >= 0)
+            g_pipeInfo[pipe.handle] = pi;
+        else if (!g_pipeInfo.erase(pipe.handle))
+            continue;
+        g_pipeGen.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -987,140 +986,217 @@ static ShaderAnalysis AnalyseVertexShader(const shader_desc* desc)
     return r;
 }
 
-// buffer -> size if it is a small constant buffer, else 0. The game updates ~3000 constant buffers per
-// frame, so the description is looked up once per buffer, not per update. Caller holds g_camMutex.
-static std::unordered_map<uint64_t, uint32_t> g_cbSize;
+// Everything about one constant buffer in one map entry: the game updates ~3000 constant buffers per frame,
+// so each update costs one lookup. Entries with size 0 remember "not a small constant buffer" (the
+// description is read once per buffer, not per update). Guarded by g_camMutex.
+struct CbState {
+    uint32_t size = 0;
+    uint32_t jitterFrame = 0;  // frame id its jittered copy belongs to; 0 = holds the game's data
+    bool wanted = false;       // a draw callback asked for its contents: only these buffers are shadowed
+    bool whole = false;        // VSBoneConstants (b3 of a skinned draw): shadowed whole, not only g_cbReadEnd
+    void* mapped = nullptr;
+    std::vector<uint8_t> shadow;
+};
+static std::unordered_map<uint64_t, CbState> g_cb;
 
-// Highest byte the add-on ever reads from a shadowed constant buffer, except bone buffers (3600 bytes,
-// read whole). Grows as shaders are analysed; copying only this prefix of each update saves most of the
-// ~1700 copies of up to 4 KB per frame. Guarded by g_camMutex.
-static std::unordered_set<uint64_t> g_boneCbs;  // buffers seen as VSBoneConstants (b3 of a skinned draw): copied whole
+// g_cbReadEnd is the highest byte the add-on ever reads from a shadowed buffer (bone buffers aside). It grows
+// as shaders are analysed; copying only that prefix of each update saves most of the copying.
 
-static uint32_t SmallConstantBufferSize(device* dev, resource res)
+// The few buffers that are shadowed (typically 5 of ~240), readable without the lock: the game updates
+// ~5000 constant buffers per frame and all other updates return right away. Written under g_camMutex.
+static std::atomic<uint64_t> g_wantedCb[32];
+static std::atomic<uint32_t> g_wantedCount{0};
+static std::atomic<bool> g_wantedOverflow{false};  // more than 32: every update takes the slow path
+
+static bool IsWantedCb(uint64_t handle)
 {
-    auto it = g_cbSize.find(res.handle);
-    if (it != g_cbSize.end())
+    if (g_wantedOverflow.load(std::memory_order_relaxed))
+        return true;
+    const uint32_t n = g_wantedCount.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_wantedCb[i].load(std::memory_order_relaxed) == handle)
+            return true;
+    return false;
+}
+
+static void AddWantedCb(uint64_t handle)
+{
+    const uint32_t n = g_wantedCount.load(std::memory_order_relaxed);
+    if (n >= std::size(g_wantedCb)) {
+        g_wantedOverflow = true;
+        return;
+    }
+    g_wantedCb[n].store(handle, std::memory_order_relaxed);
+    g_wantedCount.store(n + 1, std::memory_order_release);
+}
+
+static void RemoveWantedCb(uint64_t handle)
+{
+    const uint32_t n = g_wantedCount.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_wantedCb[i].load(std::memory_order_relaxed) == handle) {
+            g_wantedCb[i].store(g_wantedCb[n - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            g_wantedCount.store(n - 1, std::memory_order_release);
+            return;
+        }
+}
+
+static CbState& GetCb(device* dev, resource res)
+{
+    auto it = g_cb.find(res.handle);
+    if (it != g_cb.end())
         return it->second;
+    CbState& cb = g_cb[res.handle];
     resource_desc d = dev->get_resource_desc(res);
-    const bool isSmallCb = d.type == resource_type::buffer &&
-                           (d.usage & resource_usage::constant_buffer) == resource_usage::constant_buffer && d.buffer.size <= 4096;
-    const uint32_t size = isSmallCb ? static_cast<uint32_t>(d.buffer.size) : 0;
-    g_cbSize.emplace(res.handle, size);
-    return size;
+    if (d.type == resource_type::buffer && (d.usage & resource_usage::constant_buffer) == resource_usage::constant_buffer &&
+        d.buffer.size <= 4096)
+        cb.size = static_cast<uint32_t>(d.buffer.size);
+    return cb;
 }
 
-static bool IsSmallConstantBuffer(device* dev, resource res)
+static void MarkWanted(CbState& cb, uint64_t handle)
 {
-    std::lock_guard<std::mutex> lock(g_camMutex);
-    return SmallConstantBufferSize(dev, res) != 0;
+    if (cb.wanted || !cb.size)
+        return;
+    cb.wanted = true;
+    AddWantedCb(handle);
 }
 
-static std::unordered_map<uint64_t, uint32_t> g_cbJitterFrame;  // buffer -> frame id its jittered copy belongs to
+// Shadowed contents of a constant buffer a draw callback wants to read, or null. The first request only
+// marks the buffer, its contents are copied from the game's next update on. Caller holds g_camMutex.
+static const std::vector<uint8_t>* Shadow(device* dev, uint64_t buffer)
+{
+    if (!buffer)
+        return nullptr;
+    CbState& cb = GetCb(dev, resource{buffer});
+    if (!cb.wanted) {
+        MarkWanted(cb, buffer);
+        return nullptr;
+    }
+    return cb.shadow.empty() ? nullptr : &cb.shadow;
+}
+
+static uint64_t g_jitteredCb = 0, g_snapshotCb = 0;  // see ApplyJitter / SnapshotCamera (rendering thread only)
 
 static void OnDestroyResource(device*, resource res)
 {
     std::lock_guard<std::mutex> lock(g_camMutex);
-    if (g_cbSize.erase(res.handle)) {
-        g_cbShadow.erase(res.handle);
-        g_boneCbs.erase(res.handle);
-        g_cbJitterFrame.erase(res.handle);
-    }
+    auto it = g_cb.find(res.handle);
+    if (it == g_cb.end())
+        return;
+    if (it->second.wanted)
+        RemoveWantedCb(res.handle);
+    g_cb.erase(it);
+    if (g_jitteredCb == res.handle)
+        g_jitteredCb = 0;
+    if (g_snapshotCb == res.handle)
+        g_snapshotCb = 0;
 }
 
 static void OnMapBuffer(device* dev, resource res, uint64_t offset, uint64_t, map_access, void** data)
 {
-    if (!IsSmallConstantBuffer(dev, res))
-        return;
     std::lock_guard<std::mutex> lock(g_camMutex);
+    CbState& cb = GetCb(dev, res);
+    if (!cb.size)
+        return;
     if (!data || !*data || offset != 0) {
         ++g_cbMapNull;
         return;
     }
     ++g_cbMaps;
-    g_cbMapped[res.handle] = *data;
+    cb.mapped = *data;
 }
 
-static void OnUnmapBuffer(device* dev, resource res)
+static void OnUnmapBuffer(device*, resource res)
 {
     std::lock_guard<std::mutex> lock(g_camMutex);
-    auto it = g_cbMapped.find(res.handle);
-    if (it == g_cbMapped.end())
+    auto it = g_cb.find(res.handle);
+    if (it == g_cb.end() || !it->second.mapped)
         return;
+    CbState& cb = it->second;
     ++g_cbUnmaps;
-    size_t size = SmallConstantBufferSize(dev, res);
-    auto& shadow = g_cbShadow[res.handle];
-    shadow.assign(static_cast<const uint8_t*>(it->second), static_cast<const uint8_t*>(it->second) + size);
-    g_cbMapped.erase(it);
+    cb.jitterFrame = 0;  // game wrote fresh (unjittered) data
+    if (cb.wanted)
+        cb.shadow.assign(static_cast<const uint8_t*>(cb.mapped), static_cast<const uint8_t*>(cb.mapped) + cb.size);
+    cb.mapped = nullptr;
+    if (g_jitteredCb == res.handle)
+        g_jitteredCb = 0;
+    if (g_snapshotCb == res.handle)
+        g_snapshotCb = 0;
 }
 
 static bool g_inOwnUpload = false;  // our jittered uploads must not reach the shadows
+
+static void ShadowUpdate(device* dev, const void* data, resource res, uint64_t offset, uint64_t size)
+{
+    if (g_debugKeys)
+        ++g_cbUpdates;
+    if (!IsWantedCb(res.handle))
+        return;  // nobody reads this buffer (only a handful are ever read)
+    // Game wrote fresh (unjittered) data: the cached jitter / camera state of this buffer is stale.
+    if (g_jitteredCb == res.handle)
+        g_jitteredCb = 0;
+    if (g_snapshotCb == res.handle)
+        g_snapshotCb = 0;
+    std::lock_guard<std::mutex> lock(g_camMutex);
+    CbState& cb = GetCb(dev, res);
+    const uint64_t full = cb.size;
+    if (!full)
+        return;
+    cb.jitterFrame = 0;
+    if (!cb.wanted)
+        return;
+    if (cb.shadow.size() < full)
+        cb.shadow.resize(full);
+    if (size == 0 || size == UINT64_MAX)  // whole buffer (UpdateSubresource without a box)
+        size = full - offset;
+    if (offset + size > full)
+        return;
+    const uint64_t readEnd = cb.whole ? full : std::min<uint64_t>(full, g_cbReadEnd);
+    if (offset < readEnd)
+        memcpy(cb.shadow.data() + offset, data, static_cast<size_t>(std::min(size, readEnd - offset)));
+}
 
 static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t offset, uint64_t size)
 {
     if (g_bypass || g_inOwnUpload || !data)
         return false;
+    if (!g_debugKeys) {
+        ShadowUpdate(dev, data, res, offset, size);
+        return false;
+    }
     const int64_t t0 = Now();
-    struct AddTicks { int64_t t0; ~AddTicks() { g_addonTicks += Now() - t0; } } addTicks{t0};
-    std::lock_guard<std::mutex> lock(g_camMutex);
-    const size_t full = SmallConstantBufferSize(dev, res);
-    if (!full)
-        return false;
-    ++g_cbUpdates;
-    if (!g_cbJitterFrame.empty())
-        g_cbJitterFrame.erase(res.handle);  // game wrote fresh (unjittered) data
-    auto& shadow = g_cbShadow[res.handle];
-    if (shadow.size() < full)
-        shadow.resize(full);
-    if (size == 0 || size == UINT64_MAX)  // whole buffer (UpdateSubresource without a box)
-        size = full - offset;
-    if (offset + size > full)
-        return false;
-    const uint64_t readEnd = g_boneCbs.count(res.handle) ? full : std::min<uint64_t>(full, g_cbReadEnd);
-    if (offset < readEnd)
-        memcpy(shadow.data() + offset, data, static_cast<size_t>(std::min(size, readEnd - offset)));
+    ShadowUpdate(dev, data, res, offset, size);
+    g_addonTicks += Now() - t0;
     return false;
 }
 
 
+// Refreshes the cached info of a bound shader; skipped when the same shader is bound again and no shader
+// was created or destroyed in between.
+static void BindShaderInfo(uint64_t handle, uint64_t& bound, uint32_t& gen, PipeInfo& info)
+{
+    const uint32_t g = g_pipeGen.load(std::memory_order_relaxed);
+    if (bound == handle && gen == g)
+        return;
+    bound = handle;
+    gen = g;
+    info = {};
+    if (!handle)
+        return;
+    std::lock_guard<std::mutex> lock(g_camMutex);
+    auto it = g_pipeInfo.find(handle);
+    if (it != g_pipeInfo.end())
+        info = it->second;
+}
+
 static void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
 {
+    BindState& s = GetBind(cmd);
     if ((stages & pipeline_stage::vertex_shader) == pipeline_stage::vertex_shader)
-        GetBind(cmd).vs = pipe.handle;
+        BindShaderInfo(pipe.handle, s.vs, s.vsGen, s.vsInfo);
     if ((stages & pipeline_stage::pixel_shader) == pipeline_stage::pixel_shader)
-        GetBind(cmd).ps = pipe.handle;
-    if (stages == pipeline_stage::depth_stencil)
-        GetBind(cmd).depthStencilState = pipe.handle;
-    if (stages == pipeline_stage::output_merger)
-        GetBind(cmd).blendState = pipe.handle;
-    if (stages == pipeline_stage::input_assembler)
-        GetBind(cmd).inputLayout = pipe.handle;
-}
-
-static void OnBindStatesTrack(command_list* cmd, uint32_t count, const dynamic_state* states, const uint32_t* values)
-{
-    for (uint32_t i = 0; i < count; ++i)
-        if (states[i] == dynamic_state::front_stencil_reference_value)
-            GetBind(cmd).stencilRef = values[i];
-        else if (states[i] == dynamic_state::primitive_topology)
-            GetBind(cmd).topology = values[i];
-}
-
-static void OnBindIndexBuffer(command_list* cmd, resource buffer, uint64_t, uint32_t)
-{
-    GetBind(cmd).indexBuffer = buffer.handle;
-}
-
-static void OnBindVertexBuffers(command_list* cmd, uint32_t first, uint32_t count, const resource* buffers, const uint64_t*,
-                                const uint32_t*)
-{
-    if (first == 0 && count > 0 && buffers)
-        GetBind(cmd).vertexBuffer0 = buffers[0].handle;
-}
-
-static void OnBindViewports(command_list* cmd, uint32_t first, uint32_t count, const viewport* vps)
-{
-    if (first == 0 && count > 0 && vps)
-        GetBind(cmd).vp = vps[0];
+        BindShaderInfo(pipe.handle, s.ps, s.psGen, s.psInfo);
 }
 
 static void OnPushDescriptors(command_list* cmd, shader_stage stages, pipeline_layout, uint32_t,
@@ -1130,13 +1206,6 @@ static void OnPushDescriptors(command_list* cmd, shader_stage stages, pipeline_l
     if ((stages & shader_stage::pixel) == shader_stage::pixel && u.type == descriptor_type::shader_resource_view &&
         u.binding == 0 && u.count > 0) {
         s.psSrv0 = static_cast<const resource_view*>(u.descriptors)[0];
-        return;
-    }
-    if ((stages & shader_stage::pixel) == shader_stage::pixel && u.type == descriptor_type::constant_buffer) {
-        const auto* r = static_cast<const buffer_range*>(u.descriptors);
-        for (uint32_t i = 0; i < u.count; ++i)
-            if (u.binding + i < 14)
-                s.psCb[u.binding + i] = r[i].buffer.handle;
         return;
     }
     if ((stages & shader_stage::vertex) != shader_stage::vertex || u.type != descriptor_type::constant_buffer)
@@ -1150,20 +1219,23 @@ static void OnPushDescriptors(command_list* cmd, shader_stage stages, pipeline_l
 static void SnapshotCamera(command_list* cmd)
 {
     BindState& s = GetBind(cmd);
-    if (!s.vs)
+    const VsCbInfo& vi = s.vsInfo.cb;
+    if (!s.mainScene || vi.slot < 0 || vi.slot >= 14)
         return;
-    std::lock_guard<std::mutex> lock(g_camMutex);
-    auto vi = g_vsInfo.find(s.vs);
-    if (vi == g_vsInfo.end() || vi->second.slot >= 14)
-        return;
-    auto sh = g_cbShadow.find(s.vsCb[vi->second.slot]);
-    if (sh == g_cbShadow.end() || sh->second.size() < vi->second.vpOffset + 64)
-        return;
-    if (!s.mainScene)
-        return;
-    if (s.vp.width < 256.0f || s.vp.height < 144.0f)
+    const uint64_t buffer = s.vsCb[vi.slot];
+    if (buffer == g_snapshotCb && g_camCur.valid && g_camCur.depth.handle == s.dsvRes)
+        return;  // same view constants as the last snapshot this frame (most main-pass draws)
+    D3D11_VIEWPORT vp = {};
+    UINT numVp = 1;
+    reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native())->RSGetViewports(&numVp, &vp);
+    if (!numVp || vp.Width < 256.0f || vp.Height < 144.0f)
         return;  // tiny scene captures share the depth size but are not the main view
-    memcpy(g_camCur.viewProj, sh->second.data() + vi->second.vpOffset, 64);
+    std::lock_guard<std::mutex> lock(g_camMutex);
+    const std::vector<uint8_t>* sh = Shadow(cmd->get_device(), buffer);
+    if (!sh || sh->size() < vi.vpOffset + 64)
+        return;
+    g_snapshotCb = buffer;
+    memcpy(g_camCur.viewProj, sh->data() + vi.vpOffset, 64);
     if (!g_camFirst.valid) {
         memcpy(g_camFirst.viewProj, g_camCur.viewProj, 64);
         g_camFirst.valid = true;
@@ -1174,15 +1246,15 @@ static void SnapshotCamera(command_list* cmd)
                 break;
             }
     }
-    if (vi->second.pvtOffset && sh->second.size() >= vi->second.pvtOffset + 16) {
-        memcpy(g_camCur.preViewTranslation, sh->second.data() + vi->second.pvtOffset, 16);
-        memcpy(g_camCur.cameraPosition, sh->second.data() + vi->second.vpOffset + 64, 16);  // CameraPositionVS @64
+    if (vi.pvtOffset && sh->size() >= vi.pvtOffset + 16) {
+        memcpy(g_camCur.preViewTranslation, sh->data() + vi.pvtOffset, 16);
+        memcpy(g_camCur.cameraPosition, sh->data() + vi.vpOffset + 64, 16);  // CameraPositionVS @64
     }
     g_camCur.valid = true;
     g_camCur.depth = resource{s.dsvRes};
     memcpy(g_camCur.jitterNdc, g_jitterNdc, sizeof(g_jitterNdc));
-    g_camCur.renderWidth = static_cast<uint32_t>(s.vp.width + 0.5f);
-    g_camCur.renderHeight = static_cast<uint32_t>(s.vp.height + 0.5f);
+    g_camCur.renderWidth = static_cast<uint32_t>(vp.Width + 0.5f);
+    g_camCur.renderHeight = static_cast<uint32_t>(vp.Height + 0.5f);
     ++g_camSnapshots;
 }
 
@@ -1208,30 +1280,32 @@ static void ApplyJitter(command_list* cmd)
     if (g_jitterNdc[0] == 0.0f && g_jitterNdc[1] == 0.0f)
         return;
     BindState& s = GetBind(cmd);
-    if (!s.vs || !s.dsv.handle)
-        return;
+    const VsCbInfo& vi = s.vsInfo.cb;
+    // g_mainDepth only changes at present, on this thread: no lock needed for the common early-out.
+    if (vi.slot < 0 || vi.slot >= 14 || !g_mainDepth.handle || s.dsvRes != g_mainDepth.handle)
+        return;  // not the main view (shadow maps, downsampled passes, UI)
+    const uint64_t buffer = s.vsCb[vi.slot];
+    static uint32_t jitteredFrame = 0;
+    if (buffer == g_jitteredCb && jitteredFrame == g_frameId)
+        return;  // already jittered for this frame and not rewritten since (most main-view draws)
     device* dev = cmd->get_device();
     std::vector<uint8_t> data;
-    uint64_t buffer = 0;
-    uint32_t vpOffset = 0;
+    const uint32_t vpOffset = vi.vpOffset;
     {
         std::lock_guard<std::mutex> lock(g_camMutex);
-        if (!g_mainDepth.handle || s.dsvRes != g_mainDepth.handle)
-            return;  // not the main view (shadow maps, downsampled passes, UI)
-        auto vi = g_vsInfo.find(s.vs);
-        if (vi == g_vsInfo.end() || vi->second.slot >= 14)
+        const std::vector<uint8_t>* sh = Shadow(dev, buffer);
+        if (!sh)
             return;
-        buffer = s.vsCb[vi->second.slot];
-        auto jf = g_cbJitterFrame.find(buffer);
-        if (jf != g_cbJitterFrame.end() && jf->second == g_frameId)
+        CbState& cb = g_cb[buffer];
+        if (cb.jitterFrame == g_frameId)
             return;  // already jittered for this frame
-        auto sh = g_cbShadow.find(buffer);
-        if (sh == g_cbShadow.end() || sh->second.size() < vi->second.vpOffset + 64 || sh->second.size() > g_cbReadEnd)
+        if (sh->size() < vpOffset + 64 || sh->size() > g_cbReadEnd)
             return;  // (re-uploading needs the whole buffer, and only the first g_cbReadEnd bytes are shadowed)
-        data = sh->second;
-        vpOffset = vi->second.vpOffset;
-        g_cbJitterFrame[buffer] = g_frameId;
+        data = *sh;
+        cb.jitterFrame = g_frameId;
     }
+    g_jitteredCb = buffer;
+    jitteredFrame = g_frameId;
     // clip.xy += jitter * clip.w  ->  add jitter * (w column) to the x and y columns.
     float* m = reinterpret_cast<float*>(data.data() + vpOffset);
     for (int r = 0; r < 4; ++r) {
@@ -1254,8 +1328,11 @@ static void CameraFrameEnd()
     if (g_debugKeys && now - last >= 5000 && g_camCur.valid) {
         last = now;
         const float* m = g_camCur.viewProj;
-        LOGI("cbuffers: maps %u (null %u), unmaps %u, updates %u, shadows %zu", g_cbMaps, g_cbMapNull, g_cbUnmaps,
-             g_cbUpdates, g_cbShadow.size());
+        size_t shadowed = 0;
+        for (const auto& e : g_cb)
+            shadowed += e.second.wanted;
+        LOGI("cbuffers: maps %u (null %u), unmaps %u, updates %u, tracked %zu, shadowed %zu", g_cbMaps, g_cbMapNull,
+             g_cbUnmaps, g_cbUpdates, g_cb.size(), shadowed);
         g_cbMaps = g_cbMapNull = g_cbUnmaps = g_cbUpdates = 0;
         LOGI("camera frames %u, unchanged vs previous frame %u | jitter %s, uploads %u, last (%.3f, %.3f) px",
              g_camFrames, g_camSameAsPrev, g_jitterEnabled ? "on" : "off", g_jitterUploads, g_jitterPx[0], g_jitterPx[1]);
@@ -1409,12 +1486,26 @@ static bool EnsureSkinVelocity(device* dev, uint32_t width, uint32_t height)
     return true;
 }
 
-static uint64_t SkinKey(const BindState& s, uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset)
+// Identifies a mesh section by its index buffer, first vertex buffer and draw range. The buffers are read
+// from the context here (only for main-view skinned/rigid draws) instead of tracking every IA bind.
+static uint64_t SkinKey(command_list* cmd, uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset)
 {
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    ID3D11Buffer* ib = nullptr;
+    ID3D11Buffer* vb = nullptr;
+    DXGI_FORMAT fmt;
+    UINT offset, stride;
+    ctx->IAGetIndexBuffer(&ib, &fmt, &offset);
+    ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &offset);
+    const uint64_t ibHandle = reinterpret_cast<uintptr_t>(ib), vbHandle = reinterpret_cast<uintptr_t>(vb);
+    if (ib)
+        ib->Release();
+    if (vb)
+        vb->Release();
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
-    mix(s.indexBuffer);
-    mix(s.vertexBuffer0);
+    mix(ibHandle);
+    mix(vbHandle);
     mix(indexCount);
     mix(firstIndex);
     mix(static_cast<uint32_t>(vertexOffset));
@@ -1426,10 +1517,17 @@ static uint64_t SkinKey(const BindState& s, uint32_t indexCount, uint32_t firstI
 static void DrawVelocityAndRestore(command_list* cmd, const BindState& s, pipeline vs, uint32_t indexCount,
                                    uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
-    const uint64_t gameVs = s.vs, gamePs = s.ps, gameDs = s.depthStencilState, gameBlend = s.blendState;
-    const uint32_t gameRef = s.stencilRef;
+    const uint64_t gameVs = s.vs, gamePs = s.ps;
     const buffer_range gameCb[2] = {{resource{s.vsCb[5]}, 0, UINT64_MAX}, {resource{s.vsCb[6]}, 0, UINT64_MAX}};
     const buffer_range ourCb[2] = {{g_sv.params, 0, UINT64_MAX}, {g_sv.prevBones, 0, UINT64_MAX}};
+    // Output-merger states are read back from the context rather than tracked on every bind.
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    ID3D11DepthStencilState* gameDs = nullptr;
+    ID3D11BlendState* gameBlend = nullptr;
+    UINT gameRef = 0, gameSampleMask = 0;
+    FLOAT gameBlendFactor[4];
+    ctx->OMGetDepthStencilState(&gameDs, &gameRef);
+    ctx->OMGetBlendState(&gameBlend, gameBlendFactor, &gameSampleMask);
 
     cmd->bind_pipeline(pipeline_stage::vertex_shader, vs);
     cmd->bind_pipeline(pipeline_stage::pixel_shader, g_sv.ps);
@@ -1443,10 +1541,12 @@ static void DrawVelocityAndRestore(command_list* cmd, const BindState& s, pipeli
     cmd->push_descriptors(shader_stage::vertex, {0}, 0, descriptor_table_update{{}, 5, 0, 2, descriptor_type::constant_buffer, gameCb});
     cmd->bind_pipeline(pipeline_stage::vertex_shader, pipeline{gameVs});
     cmd->bind_pipeline(pipeline_stage::pixel_shader, pipeline{gamePs});
-    cmd->bind_pipeline(pipeline_stage::depth_stencil, pipeline{gameDs});
-    const dynamic_state refState = dynamic_state::front_stencil_reference_value;
-    cmd->bind_pipeline_states(1, &refState, &gameRef);
-    cmd->bind_pipeline(pipeline_stage::output_merger, pipeline{gameBlend});
+    ctx->OMSetDepthStencilState(gameDs, gameRef);
+    ctx->OMSetBlendState(gameBlend, gameBlendFactor, gameSampleMask);
+    if (gameDs)
+        gameDs->Release();
+    if (gameBlend)
+        gameBlend->Release();
 }
 
 static void BeginVelocityFrame(command_list* cmd)
@@ -1466,35 +1566,38 @@ static void DrawSkinVelocity(command_list* cmd, uint32_t indexCount, uint32_t in
     if (!g_skinVelocityEnabled)
         return;
     BindState& s = GetBind(cmd);
-    if (!s.vs || !s.dsv.handle || s.rtvCount == 0)
+    if (!s.vsInfo.skinned || !s.dsv.handle || s.rtvCount == 0)
         return;  // color passes only (skip depth-only and shadow passes)
+    if (!g_mainDepth.handle || s.dsvRes != g_mainDepth.handle)
+        return;
     device* dev = cmd->get_device();
 
-    SkinInfo skin;
+    const SkinInfo skin = s.vsInfo.skin;
     SkinVelocityParams p = {};
-    std::vector<uint8_t> bones;
+    static uint8_t bones[3600];  // draw callbacks run on the rendering thread only
     Camera prevCam;
     {
         std::lock_guard<std::mutex> lock(g_camMutex);
-        if (!g_mainDepth.handle || s.dsvRes != g_mainDepth.handle)
+        if (!s.vsCb[3])
             return;
-        auto si = g_skinVs.find(s.vs);
-        if (si == g_skinVs.end())
+        CbState& bc = GetCb(dev, resource{s.vsCb[3]});
+        if (!bc.size)
             return;
-        skin = si->second;
-        if (g_boneCbs.insert(s.vsCb[3]).second)
+        if (!bc.whole) {
+            bc.whole = true;
+            MarkWanted(bc, s.vsCb[3]);
             return;  // first sighting: copied whole from the next update on
-        auto g0 = g_cbShadow.find(s.vsCb[0]);
-        auto b1 = g_cbShadow.find(s.vsCb[1]);
-        auto b3 = g_cbShadow.find(s.vsCb[3]);
-        if (g0 == g_cbShadow.end() || b1 == g_cbShadow.end() || b3 == g_cbShadow.end() || b3->second.size() < 3600 ||
-            b1->second.size() < 64 || g0->second.size() < skin.extension + 12)
+        }
+        const std::vector<uint8_t>* g0 = Shadow(dev, s.vsCb[0]);
+        const std::vector<uint8_t>* b1 = Shadow(dev, s.vsCb[1]);
+        const std::vector<uint8_t>* b3 = Shadow(dev, s.vsCb[3]);
+        if (!g0 || !b1 || !b3 || b3->size() < 3600 || b1->size() < 64 || g0->size() < skin.extension + 12)
             return;
-        memcpy(p.curL2W, g0->second.data() + skin.l2w, 64);
-        memcpy(p.meshOrigin, g0->second.data() + skin.origin, 12);
-        memcpy(p.meshExtension, g0->second.data() + skin.extension, 12);
-        memcpy(p.curVP, b1->second.data(), 64);  // shadow = unjittered
-        bones.assign(b3->second.begin(), b3->second.begin() + 3600);
+        memcpy(p.curL2W, g0->data() + skin.l2w, 64);
+        memcpy(p.meshOrigin, g0->data() + skin.origin, 12);
+        memcpy(p.meshExtension, g0->data() + skin.extension, 12);
+        memcpy(p.curVP, b1->data(), 64);  // shadow = unjittered
+        memcpy(bones, b3->data(), 3600);
         prevCam = g_camPrev;
     }
     if (!prevCam.valid)
@@ -1507,9 +1610,9 @@ static void DrawSkinVelocity(command_list* cmd, uint32_t indexCount, uint32_t in
     }
 
     // Previous frame's bones / LocalToWorld for this mesh section, then remember this frame's.
-    uint64_t key = SkinKey(s, indexCount, firstIndex, vertexOffset);
+    uint64_t key = SkinKey(cmd, indexCount, firstIndex, vertexOffset);
     SkinHistory& hist = g_skinHistory[key];
-    const uint8_t* prevBones = bones.data();
+    const uint8_t* prevBones = bones;
     memcpy(p.prevL2W, p.curL2W, 64);
     if (hist.frame != 0 && hist.frame + 1 == g_frameId) {
         prevBones = hist.bones;
@@ -1533,7 +1636,7 @@ static void DrawSkinVelocity(command_list* cmd, uint32_t indexCount, uint32_t in
 
     hist.frame = g_frameId;
     memcpy(hist.l2w, p.curL2W, 64);
-    memcpy(hist.bones, bones.data(), 3600);
+    memcpy(hist.bones, bones, 3600);
     ++g_sv.draws;
 }
 
@@ -1546,7 +1649,13 @@ struct RigidInstance {
     float l2w[16];   // translated LocalToWorld of that frame (pairs with that frame's view projection)
     float world[3];  // world-space translation, camera independent
 };
-static std::unordered_map<uint64_t, std::vector<RigidInstance>> g_rigidCur, g_rigidPrev;
+// Instances of one geometry this frame and last frame: one map lookup per draw (~1600 per frame). The
+// vectors keep their memory from frame to frame.
+struct RigidGeometry {
+    uint32_t frame = 0;  // frame `cur` belongs to
+    std::vector<RigidInstance> cur, prev;
+};
+static std::unordered_map<uint64_t, RigidGeometry> g_rigid;
 static uint32_t g_rigidFrame = 0;
 static unsigned g_rigidDraws = 0, g_rigidChecked = 0;
 static bool g_rigidVelocityEnabled = true;
@@ -1570,71 +1679,66 @@ static void DrawRigidVelocity(command_list* cmd, uint32_t indexCount, uint32_t i
     if (!g_rigidVelocityEnabled || !g_skinVelocityEnabled || instanceCount != 1)
         return;
     BindState& s = GetBind(cmd);
-    if (!s.vs || !s.dsv.handle || s.rtvCount == 0)
+    if (!s.vsInfo.rigid || !s.dsv.handle || s.rtvCount == 0)
         return;
+    if (!g_mainDepth.handle || s.dsvRes != g_mainDepth.handle || !g_camPrev.valid)
+        return;  // (g_camPrev only changes at present, on this thread)
     device* dev = cmd->get_device();
 
     SkinVelocityParams p = {};
     float world[3];
-    Camera prevCam;
     {
         std::lock_guard<std::mutex> lock(g_camMutex);
-        if (!g_mainDepth.handle || s.dsvRes != g_mainDepth.handle)
+        const uint32_t l2w = s.vsInfo.rigidL2W;
+        const std::vector<uint8_t>* g0 = Shadow(dev, s.vsCb[0]);
+        const std::vector<uint8_t>* b1 = Shadow(dev, s.vsCb[1]);
+        if (!g0 || !b1 || g0->size() < l2w + 64 || b1->size() < 96)
             return;
-        auto ri = g_rigidVs.find(s.vs);
-        if (ri == g_rigidVs.end())
-            return;
-        auto g0 = g_cbShadow.find(s.vsCb[0]);
-        auto b1 = g_cbShadow.find(s.vsCb[1]);
-        if (g0 == g_cbShadow.end() || b1 == g_cbShadow.end() || g0->second.size() < ri->second + 64 || b1->second.size() < 96)
-            return;
-        memcpy(p.curL2W, g0->second.data() + ri->second, 64);
-        memcpy(p.curVP, b1->second.data(), 64);
-        const float* pvt = reinterpret_cast<const float*>(b1->second.data() + 80);
+        memcpy(p.curL2W, g0->data() + l2w, 64);
+        memcpy(p.curVP, b1->data(), 64);
+        const float* pvt = reinterpret_cast<const float*>(b1->data() + 80);
         for (int i = 0; i < 3; ++i)
             world[i] = p.curL2W[12 + i] - pvt[i];
-        prevCam = g_camPrev;
     }
-    if (!prevCam.valid)
-        return;
 
     if (g_rigidFrame != g_frameId) {
-        // Keep the vectors' memory: emptying them instead of the maps avoids ~1000 allocations per frame.
-        if (g_rigidFrame + 1 == g_frameId)
-            g_rigidPrev.swap(g_rigidCur);
-        else
-            for (auto& e : g_rigidPrev)
-                e.second.clear();
-        for (auto& e : g_rigidCur)
-            e.second.clear();
-        if (g_rigidCur.size() > 4096)  // level change: drop geometry that no longer exists
-            g_rigidCur.clear();
+        if (g_rigid.size() > 4096)  // level change: drop geometry that no longer exists
+            g_rigid.clear();
         g_rigidFrame = g_frameId;
     }
-    uint64_t base = SkinKey(s, indexCount, firstIndex, vertexOffset);
+    uint64_t base = SkinKey(cmd, indexCount, firstIndex, vertexOffset);
     RigidInstance inst;
     memcpy(inst.l2w, p.curL2W, 64);
     memcpy(inst.world, world, 12);
     ++g_rigidChecked;
     const RigidInstance* best = nullptr;
     float bestD2 = 1e30f;
-    auto& curList = g_rigidCur[base];
-    auto prevIt = g_rigidPrev.find(base);
+    RigidGeometry& geo = g_rigid[base];
+    if (geo.frame != g_frameId) {  // first draw of this geometry this frame
+        if (geo.frame + 1 == g_frameId)
+            geo.prev.swap(geo.cur);
+        else
+            geo.prev.clear();  // not drawn last frame: no history
+        geo.cur.clear();
+        geo.frame = g_frameId;
+    }
+    auto& curList = geo.cur;
+    const auto& prevList = geo.prev;
     // Fast path: the game draws in a stable order, so the same slot last frame is usually this instance.
     // An exact match there means static; only otherwise search all candidates for the nearest.
-    if (prevIt != g_rigidPrev.end() && curList.size() < prevIt->second.size() &&
-        memcmp(prevIt->second[curList.size()].l2w, inst.l2w, sizeof(inst.l2w)) == 0) {
+    if (curList.size() < prevList.size() && memcmp(prevList[curList.size()].l2w, inst.l2w, sizeof(inst.l2w)) == 0) {
         curList.push_back(inst);
         return;
     }
-    if (prevIt != g_rigidPrev.end())
-        for (const RigidInstance& cand : prevIt->second) {
+    {
+        for (const RigidInstance& cand : prevList) {
             float d2 = InstanceDistance2(inst.l2w, inst.world, cand);
             if (d2 < bestD2) {
                 bestD2 = d2;
                 best = &cand;
             }
         }
+    }
     float prevL2W[16];
     bool moved = best && bestD2 > 1e-4f && bestD2 < 50.0f * 50.0f;  // exact match = static, far = unrelated
     if (moved)
@@ -1644,7 +1748,7 @@ static void DrawRigidVelocity(command_list* cmd, uint32_t indexCount, uint32_t i
         return;  // static this frame (or new): camera motion vectors are exact
 
     memcpy(p.prevL2W, prevL2W, 64);
-    memcpy(p.prevVP, prevCam.viewProj, 64);
+    memcpy(p.prevVP, g_camPrev.viewProj, 64);
     memcpy(p.jitVP, p.curVP, 64);
     for (int r = 0; r < 4; ++r) {
         p.jitVP[r * 4 + 0] += g_jitterNdc[0] * p.jitVP[r * 4 + 3];
@@ -1666,7 +1770,7 @@ static void LogUpscalerStats();
 static void LogSkinVelocityStats()
 {
     LogUpscalerStats();
-    LOGI("rigid velocity: %u moving draws of %u checked, %zu geometries", g_rigidDraws, g_rigidChecked, g_rigidCur.size());
+    LOGI("rigid velocity: %u moving draws of %u checked, %zu geometries", g_rigidDraws, g_rigidChecked, g_rigid.size());
     g_rigidDraws = g_rigidChecked = 0;
     LOGI("skin velocity: %u draws (%u with previous-frame data), %zu tracked sections", g_sv.draws, g_sv.withHistory,
          g_skinHistory.size());
@@ -2103,12 +2207,7 @@ static bool MaybeRunMotionPass(command_list* cmd)
     if (g_mvDoneThisFrame)
         return false;
     BindState& s = GetBind(cmd);
-    bool isFinal;
-    {
-        std::lock_guard<std::mutex> lock(g_camMutex);
-        isFinal = s.ps && g_finalPassPs.count(s.ps) != 0;
-    }
-    if (!isFinal)
+    if (!s.psInfo.isFinal)
         return false;
     g_mvDoneThisFrame = true;
     return RunMotionPass(cmd, s, s.psSrv0);
@@ -2287,12 +2386,13 @@ static bool OnDraw(command_list* cmd, uint32_t n, uint32_t, uint32_t, uint32_t)
 {
     if (g_bypass)
         return false;
-    const int64_t t0 = Now();
+    const int64_t t0 = g_debugKeys ? Now() : 0;
     ApplyJitter(cmd);
     SnapshotCamera(cmd);
     const bool replaced = MaybeRunMotionPass(cmd);
     Trace("DRAW n=%u", n);
-    g_addonTicks += Now() - t0;
+    if (g_debugKeys)
+        g_addonTicks += Now() - t0;
     return replaced;
 }
 
@@ -2301,14 +2401,15 @@ static bool OnDrawIndexed(command_list* cmd, uint32_t n, uint32_t instances, uin
 {
     if (g_bypass)
         return false;
-    const int64_t t0 = Now();
+    const int64_t t0 = g_debugKeys ? Now() : 0;
     ApplyJitter(cmd);
     DrawSkinVelocity(cmd, n, instances, firstIndex, vertexOffset, firstInstance);
     DrawRigidVelocity(cmd, n, instances, firstIndex, vertexOffset, firstInstance);
     SnapshotCamera(cmd);
     const bool replaced = MaybeRunMotionPass(cmd);
     Trace("DRAWIDX n=%u", n);
-    g_addonTicks += Now() - t0;
+    if (g_debugKeys)
+        g_addonTicks += Now() - t0;
     return replaced;
 }
 
@@ -2492,10 +2593,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBuffer);
         reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
-        reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
-        reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindStatesTrack);
-        reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
-        reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         if (g_traceEnabled)

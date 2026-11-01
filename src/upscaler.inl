@@ -147,25 +147,32 @@ static bool RunUpscalerAndFinalPass(command_list* cmd, BindState& s, resource sc
     if (!InitUpscaler(dev))
         return false;
 
-    // The final pass reads ColorScale / OverlayColor / InverseGamma from its $Globals.
-    FinalPsInfo info;
+    // The final pass reads ColorScale / OverlayColor / InverseGamma from its $Globals. Pixel shader state is
+    // read from the context here (once per frame) instead of being tracked on every bind.
+    const FinalPsInfo info = s.psInfo.fpi;
+    if (!s.psInfo.haveFinalInfo || info.slot >= 14)
+        return false;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
     std::vector<uint8_t> globals;
     {
+        ID3D11Buffer* cb = nullptr;
+        ctx->PSGetConstantBuffers(info.slot, 1, &cb);
+        if (cb)
+            cb->Release();
         std::lock_guard<std::mutex> lock(g_camMutex);
-        auto fi = g_finalPsInfo.find(s.ps);
-        if (fi == g_finalPsInfo.end() || fi->second.slot >= 14)
+        const std::vector<uint8_t>* sh = Shadow(dev, reinterpret_cast<uintptr_t>(cb));
+        if (!sh)
             return false;
-        info = fi->second;
-        auto sh = g_cbShadow.find(s.psCb[info.slot]);
-        if (sh == g_cbShadow.end())
-            return false;
-        globals = sh->second;
+        globals = *sh;
     }
     if (globals.size() < info.inverseGamma + 4 || globals.size() < info.overlayColor + 16 || globals.size() < info.colorScale + 12)
         return false;
 
+    D3D11_VIEWPORT vp = {};
+    UINT numVp = 1;
+    ctx->RSGetViewports(&numVp, &vp);
     const uint32_t rw = cur.renderWidth, rh = cur.renderHeight;
-    const uint32_t ow = static_cast<uint32_t>(s.vp.width + 0.5f), oh = static_cast<uint32_t>(s.vp.height + 0.5f);
+    const uint32_t ow = static_cast<uint32_t>(vp.Width + 0.5f), oh = static_cast<uint32_t>(vp.Height + 0.5f);
     if (!rw || !rh || !ow || !oh || !g_mv.motion.handle || !EnsureUpscalerFeature(cmd, rw, rh, ow, oh))
         return false;
 
@@ -182,7 +189,6 @@ static bool RunUpscalerAndFinalPass(command_list* cmd, BindState& s, resource sc
     ep.InReset = g_up.resetNext ? 1 : 0;
     ep.InMVScaleX = static_cast<float>(rw);  // our vectors are in UV units of the render region
     ep.InMVScaleY = static_cast<float>(rh);
-    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
     const int64_t evalStart = Now();
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_up.feature, g_up.params, &ep);
     const int64_t evalTicks = Now() - evalStart;
@@ -201,30 +207,38 @@ static bool RunUpscalerAndFinalPass(command_list* cmd, BindState& s, resource sc
     memcpy(c + 0, globals.data() + info.colorScale, 12);
     memcpy(c + 4, globals.data() + info.overlayColor, 16);
     memcpy(c + 8, globals.data() + info.inverseGamma, 4);
-    c[10] = s.vp.x;
-    c[11] = s.vp.y;
+    c[10] = vp.TopLeftX;
+    c[11] = vp.TopLeftY;
     g_inOwnUpload = true;
     dev->update_buffer_region(c, g_up.constants, 0, sizeof(c));
     g_inOwnUpload = false;
 
-    const buffer_range ourCb = {g_up.constants, 0, UINT64_MAX};
-    const buffer_range gameCb = {resource{s.psCb[13]}, 0, UINT64_MAX};
-    const uint32_t topology = static_cast<uint32_t>(primitive_topology::triangle_list);
-    const dynamic_state topoState = dynamic_state::primitive_topology;
+    // Game state our draw changes, put back afterwards.
+    ID3D11Buffer* gameCb = nullptr;
+    ID3D11InputLayout* gameLayout = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY gameTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ctx->PSGetConstantBuffers(13, 1, &gameCb);
+    ctx->IAGetInputLayout(&gameLayout);
+    ctx->IAGetPrimitiveTopology(&gameTopology);
 
+    const buffer_range ourCb = {g_up.constants, 0, UINT64_MAX};
     cmd->bind_pipeline(pipeline_stage::vertex_shader, g_up.vs);
     cmd->bind_pipeline(pipeline_stage::pixel_shader, g_up.ps);
-    cmd->bind_pipeline(pipeline_stage::input_assembler, pipeline{0});
-    cmd->bind_pipeline_states(1, &topoState, &topology);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd->push_descriptors(shader_stage::pixel, {0}, 0, descriptor_table_update{{}, 0, 0, 1, descriptor_type::shader_resource_view, &g_up.outputSrv});
     cmd->push_descriptors(shader_stage::pixel, {0}, 0, descriptor_table_update{{}, 13, 0, 1, descriptor_type::constant_buffer, &ourCb});
     cmd->draw(3, 1, 0, 0);
 
-    cmd->push_descriptors(shader_stage::pixel, {0}, 0, descriptor_table_update{{}, 13, 0, 1, descriptor_type::constant_buffer, &gameCb});
+    ctx->PSSetConstantBuffers(13, 1, &gameCb);
     cmd->push_descriptors(shader_stage::pixel, {0}, 0, descriptor_table_update{{}, 0, 0, 1, descriptor_type::shader_resource_view, &s.psSrv0});
-    cmd->bind_pipeline(pipeline_stage::input_assembler, pipeline{s.inputLayout});
-    cmd->bind_pipeline_states(1, &topoState, &s.topology);
+    ctx->IASetInputLayout(gameLayout);
+    ctx->IASetPrimitiveTopology(gameTopology);
     cmd->bind_pipeline(pipeline_stage::vertex_shader, pipeline{s.vs});
     cmd->bind_pipeline(pipeline_stage::pixel_shader, pipeline{s.ps});
+    if (gameCb)
+        gameCb->Release();
+    if (gameLayout)
+        gameLayout->Release();
     return true;
 }
