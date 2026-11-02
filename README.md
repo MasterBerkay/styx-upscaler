@@ -11,6 +11,8 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 - Upscaler call through the NVIDIA NGX API, which OptiScaler maps to FSR / XeSS / DLSS
 - The upscaled image is fed through an equivalent of the game's gamma pass, HUD stays native
 - Fix for the invisible menus of the DX11 mode (Scaleform binds RTV/DSV pairs of different size)
+- Fix for the black cutscenes of the DX11 mode: the game draws its Bink movies without an input layout, which
+  D3D11 drops; the add-on draws the decoded Y / Cr / Cb planes itself with the game's conversion constants
 - Input-layout cache against camera-turn stutter
 - Low CPU overhead on the game's single rendering thread (no locks or lookups on ordinary draw calls)
 - AMD Anti-Lag 2 (DX11 SDK) with a `SetMaximumFrameLatency` fallback on other GPUs
@@ -22,6 +24,7 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 Player downloads (bundled with ReShade and OptiScaler) are on
 [Nexus Mods](https://www.nexusmods.com/styxmasterofshadows/mods/9). Companion mod:
 [Styx Engine Fix](https://www.nexusmods.com/styxmasterofshadows/mods/10) ([source](https://github.com/MasterBerkay/styx-engine-fix)) – high FPS without flying ragdolls.
+Sister project for *Styx: Shards of Darkness*: [styx2-upscaler](https://github.com/MasterBerkay/styx2-upscaler).
 
 ## How it works
 
