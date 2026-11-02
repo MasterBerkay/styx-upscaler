@@ -2383,10 +2383,75 @@ static void MotionFrameEnd()
     g_depthCopy.copiedThisFrame = false;
 }
 
+// ---------------------------------------------------------------- cutscenes
+
+#include "movie_vs.h"
+#include "movie_ps.h"
+
+// The game's DX11 renderer draws its Bink cutscenes (decoded Y / Cr / Cb planes, 4-vertex strip) without an input
+// layout, which D3D11 drops: the screen stays black (DX9 is fine). Draw that image ourselves instead.
+static bool MaybeDrawMovie(command_list* cmd, uint32_t n)
+{
+    if (n != 4)
+        return false;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    ID3D11InputLayout* layout = nullptr;
+    ctx->IAGetInputLayout(&layout);
+    if (layout) {
+        layout->Release();
+        return false;
+    }
+    ID3D11ShaderResourceView* srv[4] = {};
+    ctx->PSGetShaderResources(0, 4, srv);
+    bool planes = srv[0] && srv[1] && srv[2] && !srv[3];
+    for (int i = 0; i < 3 && planes; ++i) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC d;
+        srv[i]->GetDesc(&d);
+        planes = d.Format == DXGI_FORMAT_R8_UNORM;
+    }
+    for (ID3D11ShaderResourceView* v : srv)
+        if (v)
+            v->Release();
+    if (!planes)
+        return false;
+
+    static ID3D11VertexShader* vs = nullptr;
+    static ID3D11PixelShader* ps = nullptr;
+    static bool failed = false;
+    if (!vs && !failed) {
+        auto* dev = reinterpret_cast<ID3D11Device*>(cmd->get_device()->get_native());
+        failed = FAILED(dev->CreateVertexShader(g_MovieVS, sizeof(g_MovieVS), nullptr, &vs)) ||
+                 FAILED(dev->CreatePixelShader(g_MoviePS, sizeof(g_MoviePS), nullptr, &ps));
+        LOGI("cutscenes: %s", failed ? "failed to create the movie shaders" : "drawing Bink movies with our own pass");
+    }
+    if (failed)
+        return false;
+    ID3D11VertexShader* gameVs = nullptr;
+    ID3D11PixelShader* gamePs = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY gameTopology;
+    ctx->VSGetShader(&gameVs, nullptr, nullptr);
+    ctx->PSGetShader(&gamePs, nullptr, nullptr);
+    ctx->IAGetPrimitiveTopology(&gameTopology);
+    ctx->VSSetShader(vs, nullptr, 0);
+    ctx->PSSetShader(ps, nullptr, 0);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->Draw(3, 0);
+    ctx->VSSetShader(gameVs, nullptr, 0);
+    ctx->PSSetShader(gamePs, nullptr, 0);
+    ctx->IASetPrimitiveTopology(gameTopology);
+    if (gameVs)
+        gameVs->Release();
+    if (gamePs)
+        gamePs->Release();
+    return true;
+}
+
 // ---------------------------------------------------------------- trace-only hooks
 
 static bool OnDraw(command_list* cmd, uint32_t n, uint32_t, uint32_t, uint32_t)
 {
+    if (MaybeDrawMovie(cmd, n))
+        return true;
     if (g_bypass)
         return false;
     const int64_t t0 = g_debugKeys ? Now() : 0;
