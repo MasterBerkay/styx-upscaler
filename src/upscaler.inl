@@ -24,6 +24,9 @@ struct Upscaler {
 };
 static Upscaler g_up;
 static bool g_upscalerEnabled = true;
+// RCAS in the final pass (live, from the overlay): on/off and strength 0..2 (1 = full RCAS).
+static bool g_sharpenEnabled = true;
+static float g_sharpness = 1.0f;
 
 static void ShutdownUpscaler(device* dev)
 {
@@ -78,7 +81,7 @@ static bool InitUpscaler(device* dev)
     pipeline_subobject vso = {pipeline_subobject_type::vertex_shader, 1, &vsd};
     pipeline_subobject pso = {pipeline_subobject_type::pixel_shader, 1, &psd};
     if (!dev->create_pipeline({0}, 1, &vso, &g_up.vs) || !dev->create_pipeline({0}, 1, &pso, &g_up.ps) ||
-        !dev->create_resource(resource_desc(48, memory_heap::default_, resource_usage::constant_buffer), nullptr,
+        !dev->create_resource(resource_desc(64, memory_heap::default_, resource_usage::constant_buffer), nullptr,
                               resource_usage::constant_buffer, &g_up.constants)) {
         LOGW("upscaler: failed to create final pass objects");
         return false;
@@ -203,12 +206,13 @@ static bool RunUpscalerAndFinalPass(command_list* cmd, BindState& s, resource sc
     ++g_up.evaluations;
 
     // Our copy of UE3's gamma pass, reading the upscaled image.
-    float c[12] = {};
+    float c[16] = {};
     memcpy(c + 0, globals.data() + info.colorScale, 12);
     memcpy(c + 4, globals.data() + info.overlayColor, 16);
     memcpy(c + 8, globals.data() + info.inverseGamma, 4);
     c[10] = vp.TopLeftX;
     c[11] = vp.TopLeftY;
+    c[12] = g_sharpenEnabled ? g_sharpness : 0.0f;
     g_inOwnUpload = true;
     dev->update_buffer_region(c, g_up.constants, 0, sizeof(c));
     g_inOwnUpload = false;

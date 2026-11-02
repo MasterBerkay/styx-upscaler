@@ -14,6 +14,8 @@ The game has no motion vectors and no jitter, so this ReShade add-on builds them
 - Input-layout cache against camera-turn stutter
 - Low CPU overhead on the game's single rendering thread (no locks or lookups on ordinary draw calls)
 - AMD Anti-Lag 2 (DX11 SDK) with a `SetMaximumFrameLatency` fallback on other GPUs
+- RCAS sharpening (AMD FidelityFX FSR 1 math) in the final pass on the gamma-corrected image, live on/off and
+  strength 0..2 in the menu (1 = full RCAS, above that extra sharpening with a contrast-limited overshoot)
 - Live quality presets (writes the engine's `GSystemSettings.ScreenPercentage`) and a settings menu in the
   ReShade overlay (Dear ImGui)
 

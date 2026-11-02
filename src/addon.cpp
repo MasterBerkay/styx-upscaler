@@ -2242,6 +2242,9 @@ static void LoadConfig()
     const std::string ini = GameDirFile("StyxUpscaler.ini");
     char key[32];
     g_upscalerEnabled = GetPrivateProfileIntA("Upscaler", "Enabled", 1, ini.c_str()) != 0;
+    g_sharpenEnabled = GetPrivateProfileIntA("Upscaler", "Sharpening", 1, ini.c_str()) != 0;
+    GetPrivateProfileStringA("Upscaler", "Sharpness", "1.0", key, sizeof(key), ini.c_str());
+    g_sharpness = std::clamp(static_cast<float>(atof(key)), 0.0f, 2.0f);
     GetPrivateProfileStringA("Upscaler", "ToggleKey", "Home", key, sizeof(key), ini.c_str());
     g_toggleKey = ParseKey(key, VK_HOME);
     GetPrivateProfileStringA("Upscaler", "QualityKey", "PageUp", key, sizeof(key), ini.c_str());
@@ -2554,6 +2557,19 @@ static void DrawSettings(effect_runtime*)
     } else {
         ImGui::TextDisabled("Quality presets unavailable (unknown game version).");
     }
+
+    // Live: the final pass reads both every frame. The strength is saved when the slider is released.
+    if (ImGui::Checkbox("Sharpening (RCAS)", &g_sharpenEnabled))
+        SaveSetting("Upscaler", "Sharpening", g_sharpenEnabled);
+    ImGui::BeginDisabled(!g_sharpenEnabled);
+    ImGui::SliderFloat("Strength", &g_sharpness, 0.0f, 2.0f, "%.2f");
+    ImGui::EndDisabled();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        char value[16];
+        snprintf(value, sizeof(value), "%.2f", g_sharpness);
+        WritePrivateProfileStringA("Upscaler", "Sharpness", value, GameDirFile("StyxUpscaler.ini").c_str());
+    }
+    ImGui::TextDisabled("AMD FidelityFX RCAS on the upscaled image. 1 = full RCAS, 2 = strongest.");
 
     ImGui::Separator();
     if (ImGui::Checkbox("AMD Anti-Lag 2", &g_antiLag2Wanted))
